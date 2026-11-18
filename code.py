@@ -1,4 +1,3 @@
-
 """
 Corrected, reproducible benchmark for:
 
@@ -30,14 +29,30 @@ Memory
 
 Run
 ---
-python corrected_benchmark.py --quick
-python corrected_benchmark.py
-python corrected_benchmark.py --mode end_to_end
-python corrected_benchmark.py --sizes 10000 50000 100000 --repeats 20
+Fairness fixes in this version
+------------------------------
+- Input validation (negative keys) is done once by the harness, outside
+  the timer, for every method. The timed radix functions are the
+  "_core" versions; the public functions still validate.
+- The previous call's list is released before the timer starts.
+- Python's cyclic garbage collector is disabled during timing.
+- Quick Sort uses the median of three random positions (seeded), because
+  median-of-low/mid/high degenerates on sorted and reverse input after
+  three-way partitioning.
+- Every configuration has its own seed, so any single configuration can
+  be regenerated exactly and the results do not depend on which sizes
+  were run in the same invocation.
+- summary.csv reports the maximum peak memory over repetitions.
+
+python code.py --quick
+python code.py
+python code.py --mode end_to_end
+python code.py --sizes 10000 --repeats 20 --memory-repeats 5
 """
 
 import argparse
 import csv
+import gc
 import random
 import statistics
 import time
@@ -53,8 +68,7 @@ ARRAY_SIZES = [
     10_000,
     50_000,
     100_000,
-    500_000,
-    1_000_000
+    500_000
 ]
 
 VALUE_RANGES = [
@@ -74,28 +88,45 @@ PATTERNS = [
 ]
 
 DEFAULT_REPEATS = 20
-DEFAULT_MEMORY_REPEATS = 3
+DEFAULT_MEMORY_REPEATS = 5
 
 RANDOM_SEED = 12345
 ORDER_SEED = 12346
+QUICKSORT_SEED = 2027
 
 
 # ============================================================
 # 2. CONVENTIONAL LSD RADIX SORT
 # ============================================================
 
-def radix_sort(values, digit_bits):
+def check_input(values, digit_bits):
+
+    """Shared validation for both radix variants (not timed)."""
 
     if digit_bits <= 0:
         raise ValueError("digit_bits must be positive")
 
-    if not values:
-        return values
-
-    if any(x < 0 for x in values):
+    if values and min(values) < 0:
         raise ValueError(
             "Only non-negative integers are supported"
         )
+
+
+def radix_sort(values, digit_bits):
+
+    """Public version: validates, then sorts in place."""
+
+    check_input(values, digit_bits)
+
+    return radix_sort_core(values, digit_bits)
+
+
+def radix_sort_core(values, digit_bits):
+
+    """Timed version: assumes validated input."""
+
+    if not values:
+        return values
 
     # Work directly on the supplied list.
     result = values
@@ -155,16 +186,18 @@ def radix_sort(values, digit_bits):
 
 def compartment_radix_sort(values, digit_bits):
 
-    if digit_bits <= 0:
-        raise ValueError("digit_bits must be positive")
+    """Public version: validates, then sorts in place."""
+
+    check_input(values, digit_bits)
+
+    compartment_radix_sort_core(values, digit_bits)
+
+
+def compartment_radix_sort_core(values, digit_bits):
+
+    """Timed version: assumes validated input."""
 
     if len(values) <= 1:
-
-        if values and values[0] < 0:
-            raise ValueError(
-                "Only non-negative integers are supported"
-            )
-
         return
 
     compartments = {}
@@ -172,11 +205,6 @@ def compartment_radix_sort(values, digit_bits):
 
     # Group numbers according to their bit lengths.
     for value in values:
-
-        if value < 0:
-            raise ValueError(
-                "Only non-negative integers are supported"
-            )
 
         if value == 0:
 
@@ -262,6 +290,9 @@ def quick_sort(values):
     if len(arr) <= 1:
         return arr
 
+    # Seeded, so every run makes the same pivot choices.
+    pick = random.Random(QUICKSORT_SEED).randint
+
     stack = [(0, len(arr) - 1)]
 
     while stack:
@@ -271,15 +302,21 @@ def quick_sort(values):
         if low >= high:
             continue
 
-        mid = (low + high) // 2
+        # Median of three random positions. Median of
+        # low/mid/high degenerates here: three-way
+        # partitioning rotates sorted runs, so the next
+        # low/mid/high sample is close to the minimum.
+        a = arr[pick(low, high)]
+        b = arr[pick(low, high)]
+        c = arr[pick(low, high)]
 
-        candidates = sorted((
-            arr[low],
-            arr[mid],
-            arr[high]
-        ))
+        if a > b:
+            a, b = b, a
 
-        pivot = candidates[1]
+        if b > c:
+            b = c
+
+        pivot = a if a > b else b
 
         lt = i = low
         gt = high
@@ -414,27 +451,27 @@ def python_sorted(values):
 # ============================================================
 
 def radix_1bit(values):
-    return radix_sort(values, 1)
+    return radix_sort_core(values, 1)
 
 
 def radix_2bit(values):
-    return radix_sort(values, 2)
+    return radix_sort_core(values, 2)
 
 
 def radix_3bit(values):
-    return radix_sort(values, 3)
+    return radix_sort_core(values, 3)
 
 
 def compartment_1bit(values):
-    compartment_radix_sort(values, 1)
+    compartment_radix_sort_core(values, 1)
 
 
 def compartment_2bit(values):
-    compartment_radix_sort(values, 2)
+    compartment_radix_sort_core(values, 2)
 
 
 def compartment_3bit(values):
-    compartment_radix_sort(values, 3)
+    compartment_radix_sort_core(values, 3)
 
 
 # ============================================================
@@ -464,6 +501,15 @@ ALGORITHMS = [
 # ============================================================
 # 9. INPUT GENERATION
 # ============================================================
+
+def config_rng(size, low, high, pattern):
+
+    """Deterministic generator for one configuration."""
+
+    return random.Random(
+        f"{RANDOM_SEED}-{size}-{low}-{high}-{pattern}"
+    )
+
 
 def make_input(size, low, high, pattern, rng):
 
@@ -605,31 +651,25 @@ def verify_algorithms():
                 )
 
     # Negative-value tests for radix algorithms.
-    for func in (
+    for func in (radix_sort, compartment_radix_sort):
 
-        radix_1bit,
-        radix_2bit,
-        radix_3bit,
+        for digit_bits in (1, 2, 3):
 
-        compartment_1bit,
-        compartment_2bit,
-        compartment_3bit
+            for bad in ([-1, 0, 1], [-5]):
 
-    ):
+                try:
 
-        try:
+                    func(bad, digit_bits)
 
-            func([-1, 0, 1])
+                except ValueError:
 
-        except ValueError:
+                    pass
 
-            pass
+                else:
 
-        else:
-
-            raise AssertionError(
-                f"{func.__name__} must reject negative values"
-            )
+                    raise AssertionError(
+                        f"{func.__name__} must reject negative values"
+                    )
 
     print("Correctness tests passed for all nine algorithms.")
 
@@ -736,57 +776,79 @@ def benchmark_timings(
     # Actual timing runs
     # --------------------------------------------------------
 
-    for repetition in range(1, repeats + 1):
+    values = result = None
 
-        order = ALGORITHMS[:]
+    gc.collect()
 
-        order_rng.shuffle(order)
+    gc_was_enabled = gc.isenabled()
 
-        for name, func, mutates in order:
+    # The cyclic collector is off while timing, so a
+    # collection triggered by one method's allocations
+    # cannot be charged to that method.
+    gc.disable()
 
-            if mode == "sorting_only":
+    try:
 
-                # Input copying is outside the timed interval.
-                values = original[:]
+        for repetition in range(1, repeats + 1):
 
-                start = time.perf_counter_ns()
+            order = ALGORITHMS[:]
 
-                result = func(values)
+            order_rng.shuffle(order)
 
-            else:
+            for name, func, mutates in order:
 
-                # Input copying and sorting are both timed.
-                start = time.perf_counter_ns()
+                # Free the previous call's list here, outside
+                # the timer, not during the next assignment.
+                values = result = None
 
-                values = original[:]
+                if mode == "sorting_only":
 
-                result = func(values)
+                    # Input copying is outside the timed interval.
+                    values = original[:]
 
-            elapsed_ns = (
-                time.perf_counter_ns() - start
-            )
+                    start = time.perf_counter_ns()
 
-            if mutates:
-                result = values
+                    result = func(values)
 
-            # Verify every measured result.
-            if result != expected:
+                else:
 
-                raise RuntimeError(
-                    f"{name} returned an incorrect result"
+                    # Input copying and sorting are both timed.
+                    start = time.perf_counter_ns()
+
+                    values = original[:]
+
+                    result = func(values)
+
+                elapsed_ns = (
+                    time.perf_counter_ns() - start
                 )
 
-            rows.append({
+                if mutates:
+                    result = values
 
-                "repetition": repetition,
+                # Verify every measured result.
+                if result != expected:
 
-                "algorithm": name,
+                    raise RuntimeError(
+                        f"{name} returned an incorrect result"
+                    )
 
-                "time_ms": elapsed_ns / 1_000_000,
+                rows.append({
 
-                "timing_mode": mode
+                    "repetition": repetition,
 
-            })
+                    "algorithm": name,
+
+                    "time_ms": elapsed_ns / 1_000_000,
+
+                    "timing_mode": mode
+
+                })
+
+    finally:
+
+        if gc_was_enabled:
+            gc.enable()
 
     return rows
 
@@ -806,6 +868,8 @@ def benchmark_memory(
     for name, func, mutates in ALGORITHMS:
 
         for repetition in range(1, memory_repeats + 1):
+
+            values = result = None
 
             tracemalloc.stop()
 
@@ -856,6 +920,25 @@ def benchmark_memory(
 # ============================================================
 # 13. SUMMARY CALCULATIONS
 # ============================================================
+
+def maxima_by_algorithm(rows, value_key):
+
+    grouped = {}
+
+    for row in rows:
+
+        grouped.setdefault(
+            row["algorithm"], []
+        ).append(row[value_key])
+
+    return {
+
+        name: max(values)
+
+        for name, values in grouped.items()
+
+    }
+
 
 def medians_by_algorithm(rows, value_key):
 
@@ -908,7 +991,8 @@ def summarize(
         "time_ms"
     )
 
-    memory = medians_by_algorithm(
+    # The paper reports the maximum over repetitions.
+    memory = maxima_by_algorithm(
         memory_rows,
         "peak_MB"
     )
@@ -1083,10 +1167,6 @@ def main():
     # Reproducible random generators.
     # --------------------------------------------------------
 
-    data_rng = random.Random(
-        RANDOM_SEED
-    )
-
     order_rng = random.Random(
         ORDER_SEED
     )
@@ -1155,6 +1235,11 @@ def main():
             "in timing."
         )
 
+    print(
+        "Input validation is outside the timer; "
+        "garbage collector is off while timing."
+    )
+
     # --------------------------------------------------------
     # Run all experiment configurations.
     # --------------------------------------------------------
@@ -1174,14 +1259,20 @@ def main():
                     f"pattern={pattern}"
                 )
 
-                # Generate one dataset per configuration.
+                # Each configuration has its own seed, so it can
+                # be regenerated exactly (e.g. for the pass-count
+                # model) regardless of what else was run.
                 original = make_input(
                     size,
                     low,
                     high,
                     pattern,
-                    data_rng
+                    config_rng(size, low, high, pattern)
                 )
+
+                # Validate once, outside every timer, for all
+                # methods alike.
+                check_input(original, 1)
 
                 expected = sorted(original)
 
